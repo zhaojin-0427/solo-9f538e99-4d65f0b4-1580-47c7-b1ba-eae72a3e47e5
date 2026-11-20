@@ -14,9 +14,12 @@ from typing import Any
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import JSONResponse
 
-from . import db
+from . import db, flotation
 from .schemas import (
+    BatchItemIn,
     CorrelationCreate,
+    FlotationBatchCreate,
+    SampleBagCreate,
     SiteCreate,
     StratumCreate,
     SuperpositionCreate,
@@ -59,13 +62,19 @@ def create_app(db_path: str | None = None) -> FastAPI:
     write_lock = threading.Lock()
 
     app = FastAPI(
-        title="考古地层对接 API",
-        version="1.0.0",
+        title="考古地层对接与浮选取样 API",
+        version="1.1.0",
         description=(
             "录入同一遗址（最多 40 个层位）的探方、层位编号与可能沉积年代段"
             "（整年闭区间，可含空档），登记跨探方层位对接与下层→上层叠压关系；"
             "直接或间接对接的层位视为同一次沉积并共用一个年份，自动完成分组、"
-            "成环检测与可行年代段计算。"
+            "成环检测与可行年代段计算。\n\n"
+            "浮选部分：按遗址登记土袋（袋号、出土层位、原始体积毫升）；登记由"
+            "一袋或多袋组成的浮选批（各袋实际取用毫升数 + 整批籽粒总数），"
+            "成功当次返回各袋余量；同一批号原样重发只记一次用量，改内容返回 409；"
+            "同一袋可被多批分次取用，累计不得超过原始体积。按遗址查询各地层组"
+            "（当前对接分组）的总粒数、用土毫升数与每升粒数；一批土跨多个地层组时"
+            "整批不纳入密度统计，各袋取用量仍计入耗用。"
         ),
     )
     app.state.conn = conn
@@ -288,6 +297,235 @@ def create_app(db_path: str | None = None) -> FastAPI:
                 db.delete_superposition(conn, superposition_id)
                 db.bump_version(conn)
             return {"deleted": superposition_id, "solution": _solution_payload(site_id)}
+
+    # ---------- 浮选取样 ----------
+
+    def _resolve_bag_location(site_id: int, body: SampleBagCreate) -> int:
+        """把 stratum_id 或 trench+layer_no 解析成层位 id，并校验属于该遗址。"""
+        if body.stratum_id is not None:
+            return _require_stratum(body.stratum_id, site_id)["id"]
+        assert body.layer_no is not None
+        if body.trench is not None:
+            stratum = db.find_stratum(conn, site_id, body.trench, body.layer_no)
+            if stratum is None:
+                raise ConflictError(
+                    f"遗址 {site_id} 中没有探方 {body.trench} 的层位 {body.layer_no}"
+                    "，请先登记层位"
+                )
+            return stratum["id"]
+        # 只给层位号：要求在该遗址内唯一
+        matches = [
+            r
+            for r in db.list_strata(conn, site_id)
+            if r["layer_no"] == body.layer_no
+        ]
+        if not matches:
+            raise ConflictError(
+                f"遗址 {site_id} 中没有层位 {body.layer_no}，请先登记层位"
+            )
+        if len(matches) > 1:
+            trenches = "、".join(sorted(r["trench"] for r in matches))
+            raise ConflictError(
+                f"层位 {body.layer_no} 在多个探方（{trenches}）中都存在，"
+                "请同时给出 trench 或改用 stratum_id"
+            )
+        return matches[0]["id"]
+
+    def _resolve_batch_items(
+        site_id: int, item_models: list[BatchItemIn]
+    ) -> list[tuple[int, float]]:
+        """把明细解析成 (bag_id, used_ml)，并保证同一袋只出现一次。"""
+        resolved: list[tuple[int, float]] = []
+        seen: set[int] = set()
+        for item in item_models:
+            if item.bag_id is not None:
+                bag = db.get_sample_bag(conn, item.bag_id)
+                if bag is None or bag["site_id"] != site_id:
+                    raise HTTPException(
+                        404, f"土袋 {item.bag_id} 不属于遗址 {site_id} 或不存在"
+                    )
+            else:
+                bag_no = item.bag_no.strip()
+                bag = db.find_sample_bag(conn, site_id, bag_no)
+                if bag is None:
+                    raise ConflictError(f"遗址 {site_id} 中不存在袋号 {bag_no!r} 的土袋")
+            if bag["id"] in seen:
+                raise ConflictError(f"袋号 {bag['bag_no']!r} 在本批中重复登记取用量")
+            seen.add(bag["id"])
+            resolved.append((bag["id"], float(item.used_ml)))
+        return resolved
+
+    def _check_capacity(
+        site_id: int,
+        resolved: list[tuple[int, float]],
+        exclude_batch_id: int | None = None,
+    ) -> None:
+        """累计取用不得超过各袋原始体积（可排除本批自身，用于原样重发）。"""
+        for bag_id, used_ml in resolved:
+            bag = db.get_sample_bag(conn, bag_id)
+            assert bag is not None
+            already = db.total_used_ml(
+                conn, bag_id, exclude_batch_id=exclude_batch_id
+            )
+            capacity = float(bag["volume_ml"])
+            if already + used_ml > capacity + flotation.EPS:
+                raise ConflictError(
+                    f"袋号 {bag['bag_no']!r} 原始体积 {capacity:g} 毫升，"
+                    f"已取用 {already:g} 毫升，本批再取 {used_ml:g} 毫升将超出",
+                    {
+                        "bag_no": bag["bag_no"],
+                        "volume_ml": flotation.round_ml(capacity),
+                        "used_ml": flotation.round_ml(already),
+                        "requested_ml": flotation.round_ml(used_ml),
+                        "remaining_ml": flotation.round_ml(
+                            max(capacity - already, 0.0)
+                        ),
+                    },
+                )
+
+    @app.post("/sites/{site_id}/bags", status_code=201, tags=["flotation"])
+    def create_sample_bag(site_id: int, body: SampleBagCreate):
+        """按遗址登记土袋：袋号、出土层位与原始体积（毫升）。"""
+        _require_site(site_id)
+        with write_lock:
+            stratum_id = _resolve_bag_location(site_id, body)
+            if db.find_sample_bag(conn, site_id, body.bag_no) is not None:
+                raise ConflictError(f"遗址 {site_id} 中袋号 {body.bag_no!r} 已存在")
+            with db.transaction(conn):
+                row = db.create_sample_bag(
+                    conn,
+                    site_id,
+                    stratum_id,
+                    body.bag_no,
+                    float(body.volume_ml),
+                    body.note,
+                )
+                db.bump_version(conn)
+            solution = load_and_solve(conn, site_id)
+            usage = flotation.usage_map(conn, [row["id"]])[row["id"]]
+            return {
+                "record": flotation.serialize_bag(row, usage, solution),
+                "solution": serialize_solution(solution, db.get_version(conn)),
+            }
+
+    @app.get("/sites/{site_id}/bags", tags=["flotation"])
+    def list_sample_bags(site_id: int):
+        """遗址全部土袋：原始体积、累计取用量与当前余量。"""
+        _require_site(site_id)
+        with write_lock:
+            solution = load_and_solve(conn, site_id)
+            return flotation.serialize_bags(conn, site_id, solution)
+
+    @app.get("/bags/{bag_id}", tags=["flotation"])
+    def get_sample_bag(bag_id: int):
+        row = db.get_sample_bag(conn, bag_id)
+        if row is None:
+            raise HTTPException(404, f"土袋 {bag_id} 不存在")
+        with write_lock:
+            solution = load_and_solve(conn, row["site_id"])
+            usage = flotation.usage_map(conn, [bag_id])[bag_id]
+            return flotation.serialize_bag(row, usage, solution)
+
+    @app.post("/sites/{site_id}/flotations", status_code=201, tags=["flotation"])
+    def create_flotation_batch(site_id: int, body: FlotationBatchCreate):
+        """登记浮选批。成功当次返回所用土袋的余量；原样重发只记一次用量。"""
+        _require_site(site_id)
+        with write_lock:
+            resolved = _resolve_batch_items(site_id, body.items)
+            existing = db.find_batch(conn, site_id, body.batch_no)
+            if existing is not None:
+                existing_items = db.list_batch_items(conn, existing["id"])
+                if not flotation.batch_content_matches(
+                    existing_items,
+                    resolved,
+                    existing["seed_count"],
+                    body.seed_count,
+                ):
+                    raise ConflictError(
+                        f"批号 {body.batch_no!r} 已登记且内容不同，不能覆盖",
+                        {
+                            "batch_id": existing["id"],
+                            "batch_no": existing["batch_no"],
+                            "existing": flotation.serialize_batch(
+                                conn, existing, load_and_solve(conn, site_id)
+                            ),
+                        },
+                    )
+                # 原样重发：幂等返回，不重复计量、不新增版本
+                solution = load_and_solve(conn, site_id)
+                return {
+                    "record": flotation.serialize_batch(conn, existing, solution),
+                    "bags": flotation.serialize_bags_by_id(
+                        conn, [b for b, _ in resolved], solution
+                    ),
+                    "report": flotation.build_report(conn, site_id),
+                    "idempotent": True,
+                }
+
+            _check_capacity(site_id, resolved)
+            with db.transaction(conn):
+                batch = db.create_batch(
+                    conn, site_id, body.batch_no, int(body.seed_count), body.note
+                )
+                for bag_id, used_ml in resolved:
+                    db.add_batch_item(conn, batch["id"], bag_id, used_ml)
+                db.bump_version(conn)
+            solution = load_and_solve(conn, site_id)
+            return {
+                "record": flotation.serialize_batch(conn, batch, solution),
+                "bags": flotation.serialize_bags_by_id(
+                    conn, [b for b, _ in resolved], solution
+                ),
+                "report": flotation.build_report(conn, site_id),
+                "idempotent": False,
+            }
+
+    @app.get("/sites/{site_id}/flotations", tags=["flotation"])
+    def list_flotation_batches(site_id: int):
+        _require_site(site_id)
+        with write_lock:
+            solution = load_and_solve(conn, site_id)
+            return [
+                flotation.serialize_batch(conn, row, solution)
+                for row in db.list_batches(conn, site_id)
+            ]
+
+    @app.get("/flotations/{batch_id}", tags=["flotation"])
+    def get_flotation_batch(batch_id: int):
+        row = db.get_batch(conn, batch_id)
+        if row is None:
+            raise HTTPException(404, f"浮选批 {batch_id} 不存在")
+        with write_lock:
+            return flotation.serialize_batch(
+                conn, row, load_and_solve(conn, row["site_id"])
+            )
+
+    @app.delete("/flotations/{batch_id}", tags=["flotation"])
+    def delete_flotation_batch(batch_id: int):
+        """撤销浮选批：取用量退回各袋，统计按剩余记录重算。"""
+        with write_lock:
+            row = db.get_batch(conn, batch_id)
+            if row is None:
+                raise HTTPException(404, f"浮选批 {batch_id} 不存在")
+            site_id = row["site_id"]
+            bag_ids = [i["bag_id"] for i in db.list_batch_items(conn, batch_id)]
+            with db.transaction(conn):
+                db.delete_batch(conn, batch_id)
+                db.bump_version(conn)
+            solution = load_and_solve(conn, site_id)
+            return {
+                "deleted": batch_id,
+                "batch_no": row["batch_no"],
+                "bags": flotation.serialize_bags_by_id(conn, bag_ids, solution),
+                "report": flotation.build_report(conn, site_id),
+            }
+
+    @app.get("/sites/{site_id}/flotation-report", tags=["flotation"])
+    def get_flotation_report(site_id: int):
+        """按遗址按地层组统计：总粒数、用土毫升数与每升粒数。"""
+        _require_site(site_id)
+        with write_lock:  # 分组与浮选记录读取同一已提交状态
+            return flotation.build_report(conn, site_id)
 
     # ---------- 查询 ----------
 

@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import sqlite3
 from contextlib import contextmanager
-from typing import Iterator, Optional
+from typing import Any, Iterator, Optional
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS meta (
@@ -61,10 +61,47 @@ CREATE TABLE IF NOT EXISTS superpositions (
     UNIQUE (site_id, lower_id, upper_id)
 );
 
+-- 土袋：一个遗址内袋号唯一；原始体积为可累计取用的上限（毫升）。
+CREATE TABLE IF NOT EXISTS sample_bags (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    site_id    INTEGER NOT NULL REFERENCES sites(id),
+    stratum_id INTEGER NOT NULL REFERENCES strata(id),
+    bag_no     TEXT NOT NULL,
+    volume_ml  REAL NOT NULL CHECK (volume_ml > 0),
+    note       TEXT,
+    created    TEXT NOT NULL DEFAULT (datetime('now')),
+    UNIQUE (site_id, bag_no)
+);
+
+-- 浮选批：一个遗址内批号唯一；籽粒总数为整批筛出量。
+CREATE TABLE IF NOT EXISTS flotation_batches (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    site_id    INTEGER NOT NULL REFERENCES sites(id),
+    batch_no   TEXT NOT NULL,
+    seed_count INTEGER NOT NULL CHECK (seed_count >= 0),
+    note       TEXT,
+    created    TEXT NOT NULL DEFAULT (datetime('now')),
+    UNIQUE (site_id, batch_no)
+);
+
+-- 一批浮选由若干袋土组成，每袋在同一批中只登记一次取用量。
+CREATE TABLE IF NOT EXISTS flotation_items (
+    id       INTEGER PRIMARY KEY AUTOINCREMENT,
+    batch_id INTEGER NOT NULL REFERENCES flotation_batches(id) ON DELETE CASCADE,
+    bag_id   INTEGER NOT NULL REFERENCES sample_bags(id),
+    used_ml  REAL NOT NULL CHECK (used_ml > 0),
+    UNIQUE (batch_id, bag_id)
+);
+
 CREATE INDEX IF NOT EXISTS idx_strata_site ON strata(site_id);
 CREATE INDEX IF NOT EXISTS idx_intervals_stratum ON stratum_intervals(stratum_id);
 CREATE INDEX IF NOT EXISTS idx_corr_site ON correlations(site_id);
 CREATE INDEX IF NOT EXISTS idx_sup_site ON superpositions(site_id);
+CREATE INDEX IF NOT EXISTS idx_bags_site ON sample_bags(site_id);
+CREATE INDEX IF NOT EXISTS idx_bags_stratum ON sample_bags(stratum_id);
+CREATE INDEX IF NOT EXISTS idx_batches_site ON flotation_batches(site_id);
+CREATE INDEX IF NOT EXISTS idx_items_batch ON flotation_items(batch_id);
+CREATE INDEX IF NOT EXISTS idx_items_bag ON flotation_items(bag_id);
 """
 
 
@@ -94,6 +131,25 @@ def transaction(conn: sqlite3.Connection) -> Iterator[sqlite3.Connection]:
     except Exception:
         conn.rollback()
         raise
+
+
+@contextmanager
+def read_snapshot(conn: sqlite3.Connection) -> Iterator[sqlite3.Connection]:
+    """在单个读事务中完成多条查询，保证读到同一个已提交快照。
+
+    已处于事务中（例如写接口内部）时直接复用当前事务，不重复 BEGIN。
+    """
+    if conn.in_transaction:
+        yield conn
+        return
+    conn.execute("BEGIN")
+    try:
+        yield conn
+    except Exception:
+        conn.rollback()
+        raise
+    else:
+        conn.commit()
 
 
 # ---------- meta / 版本号 ----------
@@ -286,3 +342,190 @@ def list_superpositions(
 
 def delete_superposition(conn: sqlite3.Connection, superposition_id: int) -> None:
     conn.execute("DELETE FROM superpositions WHERE id = ?", (superposition_id,))
+
+
+# ---------- 土袋 ----------
+
+def create_sample_bag(
+    conn: sqlite3.Connection,
+    site_id: int,
+    stratum_id: int,
+    bag_no: str,
+    volume_ml: float,
+    note: Optional[str],
+) -> sqlite3.Row:
+    cur = conn.execute(
+        "INSERT INTO sample_bags(site_id, stratum_id, bag_no, volume_ml, note) "
+        "VALUES (?, ?, ?, ?, ?)",
+        (site_id, stratum_id, bag_no, volume_ml, note),
+    )
+    return conn.execute(
+        "SELECT * FROM sample_bags WHERE id = ?", (cur.lastrowid,)
+    ).fetchone()
+
+
+def find_sample_bag(
+    conn: sqlite3.Connection, site_id: int, bag_no: str
+) -> Optional[sqlite3.Row]:
+    return conn.execute(
+        "SELECT * FROM sample_bags WHERE site_id = ? AND bag_no = ?",
+        (site_id, bag_no),
+    ).fetchone()
+
+
+def get_sample_bag(
+    conn: sqlite3.Connection, bag_id: int
+) -> Optional[sqlite3.Row]:
+    return conn.execute(
+        "SELECT * FROM sample_bags WHERE id = ?", (bag_id,)
+    ).fetchone()
+
+
+def list_sample_bags(
+    conn: sqlite3.Connection, site_id: int
+) -> list[sqlite3.Row]:
+    return conn.execute(
+        "SELECT * FROM sample_bags WHERE site_id = ? ORDER BY id", (site_id,)
+    ).fetchall()
+
+
+def total_used_ml(
+    conn: sqlite3.Connection, bag_id: int, exclude_batch_id: Optional[int] = None
+) -> float:
+    """某袋在全部浮选批中已占用的毫升数（可按批排除，用于原样重发判定）。"""
+    sql = (
+        "SELECT COALESCE(SUM(used_ml), 0) AS total FROM flotation_items "
+        "WHERE bag_id = ?"
+    )
+    params: list[Any] = [bag_id]
+    if exclude_batch_id is not None:
+        sql += " AND batch_id <> ?"
+        params.append(exclude_batch_id)
+    return float(conn.execute(sql, params).fetchone()["total"])
+
+
+def bag_usage_rows(
+    conn: sqlite3.Connection, bag_ids: list[int]
+) -> dict[int, dict[str, Any]]:
+    """批量统计各袋的累计取用量与批次数。"""
+    if not bag_ids:
+        return {}
+    marks = ", ".join("?" for _ in bag_ids)
+    rows = conn.execute(
+        f"SELECT bag_id, COALESCE(SUM(used_ml), 0) AS used_ml, "
+        f"COUNT(*) AS batch_count FROM flotation_items "
+        f"WHERE bag_id IN ({marks}) GROUP BY bag_id",
+        bag_ids,
+    ).fetchall()
+    return {
+        r["bag_id"]: {
+            "used_ml": float(r["used_ml"]),
+            "batch_count": int(r["batch_count"]),
+        }
+        for r in rows
+    }
+
+
+# ---------- 浮选批 ----------
+
+def create_batch(
+    conn: sqlite3.Connection,
+    site_id: int,
+    batch_no: str,
+    seed_count: int,
+    note: Optional[str],
+) -> sqlite3.Row:
+    cur = conn.execute(
+        "INSERT INTO flotation_batches(site_id, batch_no, seed_count, note) "
+        "VALUES (?, ?, ?, ?)",
+        (site_id, batch_no, seed_count, note),
+    )
+    return conn.execute(
+        "SELECT * FROM flotation_batches WHERE id = ?", (cur.lastrowid,)
+    ).fetchone()
+
+
+def find_batch(
+    conn: sqlite3.Connection, site_id: int, batch_no: str
+) -> Optional[sqlite3.Row]:
+    return conn.execute(
+        "SELECT * FROM flotation_batches WHERE site_id = ? AND batch_no = ?",
+        (site_id, batch_no),
+    ).fetchone()
+
+
+def get_batch(conn: sqlite3.Connection, batch_id: int) -> Optional[sqlite3.Row]:
+    return conn.execute(
+        "SELECT * FROM flotation_batches WHERE id = ?", (batch_id,)
+    ).fetchone()
+
+
+def list_batches(conn: sqlite3.Connection, site_id: int) -> list[sqlite3.Row]:
+    return conn.execute(
+        "SELECT * FROM flotation_batches WHERE site_id = ? ORDER BY id", (site_id,)
+    ).fetchall()
+
+
+def delete_batch(conn: sqlite3.Connection, batch_id: int) -> None:
+    """撤销浮选批：批与全部取用明细一并删除，土袋余量随之恢复。"""
+    conn.execute("DELETE FROM flotation_items WHERE batch_id = ?", (batch_id,))
+    conn.execute("DELETE FROM flotation_batches WHERE id = ?", (batch_id,))
+
+
+def add_batch_item(
+    conn: sqlite3.Connection, batch_id: int, bag_id: int, used_ml: float
+) -> None:
+    conn.execute(
+        "INSERT INTO flotation_items(batch_id, bag_id, used_ml) VALUES (?, ?, ?)",
+        (batch_id, bag_id, used_ml),
+    )
+
+
+def list_batch_items(
+    conn: sqlite3.Connection, batch_id: int
+) -> list[sqlite3.Row]:
+    return conn.execute(
+        "SELECT i.*, g.bag_no, g.volume_ml, g.stratum_id, "
+        "       s.trench, s.layer_no "
+        "FROM flotation_items i "
+        "JOIN sample_bags g ON g.id = i.bag_id "
+        "JOIN strata s ON s.id = g.stratum_id "
+        "WHERE i.batch_id = ? ORDER BY i.id",
+        (batch_id,),
+    ).fetchall()
+
+
+def items_for_site(
+    conn: sqlite3.Connection, site_id: int
+) -> list[sqlite3.Row]:
+    """某遗址全部批次的取用明细（含批号、土袋与地层信息）。"""
+    return conn.execute(
+        "SELECT i.batch_id, i.bag_id, i.used_ml, "
+        "       b.batch_no, b.seed_count, "
+        "       g.bag_no, g.volume_ml, g.stratum_id, "
+        "       s.trench, s.layer_no "
+        "FROM flotation_items i "
+        "JOIN flotation_batches b ON b.id = i.batch_id "
+        "JOIN sample_bags g ON g.id = i.bag_id "
+        "JOIN strata s ON s.id = g.stratum_id "
+        "WHERE b.site_id = ? ORDER BY i.batch_id, i.id",
+        (site_id,),
+    ).fetchall()
+
+
+def items_for_site(
+    conn: sqlite3.Connection, site_id: int
+) -> list[sqlite3.Row]:
+    """某遗址全部批次的取用明细（含批号、土袋与地层信息）。"""
+    return conn.execute(
+        "SELECT i.batch_id, i.bag_id, i.used_ml, "
+        "       b.batch_no, b.seed_count, "
+        "       g.bag_no, g.volume_ml, g.stratum_id, "
+        "       s.trench, s.layer_no "
+        "FROM flotation_items i "
+        "JOIN flotation_batches b ON b.id = i.batch_id "
+        "JOIN sample_bags g ON g.id = i.bag_id "
+        "JOIN strata s ON s.id = g.stratum_id "
+        "WHERE b.site_id = ? ORDER BY i.batch_id, i.id",
+        (site_id,),
+    ).fetchall()
